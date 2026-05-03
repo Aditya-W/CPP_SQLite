@@ -1,5 +1,10 @@
 #include <iostream>
 #include <string>
+#include <sstream>
+#include <cstdint>
+
+const uint32_t COLUMN_USERNAME_SIZE = 32;
+const uint32_t COLUMN_EMAIL_SIZE = 255;
 
 enum class MetaCommandResult
 {
@@ -10,7 +15,8 @@ enum class MetaCommandResult
 enum class PrepareResult
 {
     PREPARE_SUCCESS,
-    PREPARE_UNRECOGNIZED_STATEMENT
+    PREPARE_UNRECOGNIZED_STATEMENT,
+    PREPARE_SYNTAX_ERROR
 };
 
 enum class StatementType
@@ -19,9 +25,17 @@ enum class StatementType
     STATEMENT_SELECT
 };
 
+struct Row
+{
+    uint32_t id;
+    char username[COLUMN_USERNAME_SIZE + 1];
+    char email[COLUMN_EMAIL_SIZE + 1];
+};
+
 struct Statement
 {
     StatementType type;
+    Row rowToInsert;
 };
 
 MetaCommandResult doMetaCommand(const std::string& command)
@@ -41,7 +55,18 @@ PrepareResult prepareStatement(const std::string& input, Statement& statement)
     if(input.length() >= 6 && input.substr(0,6)=="insert")
     {
         statement.type = StatementType::STATEMENT_INSERT;
-        return PrepareResult::PREPARE_SUCCESS;
+
+        std::istringstream iss(input);
+        std::string keyword;
+
+        if(iss >> keyword >> statement.rowToInsert.id >> statement.rowToInsert.username >> statement.rowToInsert.email)
+        {
+            return PrepareResult::PREPARE_SUCCESS;
+        }
+        else
+        {
+            return PrepareResult::PREPARE_SYNTAX_ERROR;
+        }
     }
     if(input.length() >= 6 && input.substr(0,6)=="select")
     {
@@ -57,7 +82,7 @@ void executeStatement(Statement& statement)
     switch(statement.type)
     {
         case StatementType::STATEMENT_INSERT:
-            std::cout << "This is where the insert statement executes.\n";
+            std::cout << "Inserting: " << statement.rowToInsert.id << " " << statement.rowToInsert.username << " " << statement.rowToInsert.email << "\n";
             break;
 
         case StatementType::STATEMENT_SELECT:
@@ -95,6 +120,11 @@ int main()
         else if(result == PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT)
         {
             std::cout << "Unrecognized Keyword at the start of " << userInput << " .\n";
+            continue;
+        }
+        else if(result == PrepareResult::PREPARE_SYNTAX_ERROR)
+        {
+            std::cout << "Syntax Error in " << userInput << ".\n";
             continue;
         }
     }
