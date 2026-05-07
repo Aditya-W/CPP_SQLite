@@ -41,6 +41,12 @@ enum class StatementType
     STATEMENT_SELECT
 };
 
+enum class ExecuteResult
+{
+    EXECUTE_SUCCESS,
+    EXECUTE_TABLE_FULL
+};
+
 struct Table
 {
     uint32_t numRows;
@@ -59,6 +65,62 @@ struct Statement
     StatementType type;
     Row rowToInsert;
 };
+
+Table* newTable()
+{
+    Table* table = new Table();
+    table->numRows = 0;
+    
+    for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    {
+        table->pages[i] = nullptr;
+    }
+
+    return table;
+}
+
+// Takes a source row and a destination
+// and writes to the source to memory
+void serializeRow(Row* source, void* destination)
+{
+    char* dest = static_cast<char*>(destination);
+
+    memcpy(dest + ID_OFFSET, &(source->id), ID_SIZE);
+    memcpy(dest + USERNAME_OFFSET, source->username, USERNAME_SIZE);
+    memcpy(dest + EMAIL_OFFSET, source->email, EMAIL_SIZE);
+}
+
+// Reads from memory and writes to row object
+void deserializeRow(void* source, Row* destination)
+{
+    char* sour = static_cast<char*>(source);
+
+    memcpy(&(destination->id), sour + ID_OFFSET, ID_SIZE);
+    memcpy(destination->username, sour + USERNAME_OFFSET, USERNAME_SIZE);
+    memcpy(destination->email, sour + EMAIL_OFFSET, EMAIL_SIZE);
+}
+
+void* rowSlot(Table* table, uint32_t rowNum)
+{
+    //calculating which page will contain the row based on its number
+    uint32_t pageNum = rowNum / ROWS_PER_PAGE;
+
+    //fetching the page
+    void* page = table->pages[pageNum];
+    
+    //if page is empty we allocate memory to it
+    if(page == nullptr)
+    {
+        page = table->pages[pageNum] = new char[PAGE_SIZE];
+    }
+
+    //calculating rowoffset and byteoffset
+    uint32_t rowOffset = rowNum % ROWS_PER_PAGE;
+    uint32_t byteOffset = rowOffset * ROW_SIZE;
+
+    //returning exact memory address by adding the byte offset
+    return static_cast<char*>(page) + byteOffset;
+}
 
 MetaCommandResult doMetaCommand(const std::string& command)
 {
@@ -99,41 +161,46 @@ PrepareResult prepareStatement(const std::string& input, Statement& statement)
     return PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT;
 }
 
-void executeStatement(Statement& statement)
+ExecuteResult executeStatement(Statement& statement, Table* table)
 {
     switch(statement.type)
     {
         case StatementType::STATEMENT_INSERT:
+        {
+            if(table->numRows >= TABLE_MAX_ROWS)
+            {
+                return ExecuteResult::EXECUTE_TABLE_FULL;
+            }
+            void* destination = static_cast<void*>(rowSlot(table, table->numRows));
+            serializeRow(&(statement.rowToInsert), destination);
+            table->numRows += 1;
             std::cout << "Inserting: " << statement.rowToInsert.id << " " << statement.rowToInsert.username << " " << statement.rowToInsert.email << "\n";
+            return ExecuteResult::EXECUTE_SUCCESS;
             break;
+        }
 
         case StatementType::STATEMENT_SELECT:
-            std::cout << "This is where the select statement executes.\n";
+        {
+            for(uint32_t i = 0; i < table->numRows; i++)
+            {
+                Row row;
+                void* source = static_cast<void*>(rowSlot(table, i));
+                deserializeRow(source, &row);
+                std::cout << "( " << row.id << ", " << row.username << ", " << row.email << " )\n";
+            }
+            return ExecuteResult::EXECUTE_SUCCESS;
             break;
+        }
     }
-}
-
-void serializeRow(Row* source, void* destination)
-{
-    char* dest = static_cast<char*>(destination);
-
-    memcpy(dest + ID_OFFSET, &(source->id), ID_SIZE);
-    memcpy(dest + USERNAME_OFFSET, source->username, USERNAME_SIZE);
-    memcpy(dest + EMAIL_OFFSET, source->email, EMAIL_SIZE);
-}
-
-void deserializeRow(void* source, Row* destination)
-{
-    char* sour = static_cast<char*>(source);
-
-    memcpy(&(destination->id), sour + ID_OFFSET, ID_SIZE);
-    memcpy(destination->username, sour + USERNAME_OFFSET, USERNAME_SIZE);
-    memcpy(destination->email, sour + EMAIL_OFFSET, EMAIL_SIZE);
+    
+    return ExecuteResult::EXECUTE_SUCCESS;
 }
 
 int main()
 {
     std::string userInput;
+
+    Table* table = newTable();
 
     while(true)
     {
@@ -142,10 +209,13 @@ int main()
         
         if(userInput[0] == '.')
         {
-            if(doMetaCommand(userInput) == MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND)
+            switch(doMetaCommand(userInput))
             {
-                std::cout << "Unrecognized Command... " << userInput << "\n";
-                continue;
+                case MetaCommandResult::META_COMMAND_SUCCESS:
+                    continue;
+                case MetaCommandResult::META_COMMAND_UNRECOGNIZED_COMMAND:
+                    std::cout << "Unrecognized Command... " << userInput << "\n";
+                    continue;
             }
         }
 
@@ -154,7 +224,11 @@ int main()
         PrepareResult result = prepareStatement(userInput,statement);
         if(result == PrepareResult::PREPARE_SUCCESS)
         {
-            executeStatement(statement);
+            if(executeStatement(statement, table) == ExecuteResult::EXECUTE_TABLE_FULL)
+            {
+                std::cout << "Error: Table is full\n";
+            }
+            std::cout << "Executed\n";
             continue;
         }
         else if(result == PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT)
