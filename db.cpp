@@ -3,6 +3,7 @@
 #include <sstream>
 #include <cstdint>
 #include <cstring>
+#include <unistd.h>
 
 const uint32_t COLUMN_USERNAME_SIZE = 32;
 const uint32_t COLUMN_EMAIL_SIZE = 255;
@@ -31,6 +32,7 @@ enum class MetaCommandResult
 enum class PrepareResult
 {
     PREPARE_SUCCESS,
+    PREPARE_STRING_TOO_LONG,
     PREPARE_UNRECOGNIZED_STATEMENT,
     PREPARE_SYNTAX_ERROR
 };
@@ -142,9 +144,25 @@ PrepareResult prepareStatement(const std::string& input, Statement& statement)
 
         std::istringstream iss(input);
         std::string keyword;
+        std::string username;
+        std::string email;
+        uint32_t id;
 
-        if(iss >> keyword >> statement.rowToInsert.id >> statement.rowToInsert.username >> statement.rowToInsert.email)
+        if(iss >> keyword >> id >> username >> email)
         {
+            if(username.length() > COLUMN_USERNAME_SIZE || email.length() > COLUMN_EMAIL_SIZE)
+            {
+                return PrepareResult::PREPARE_STRING_TOO_LONG;
+            }
+
+            statement.rowToInsert.id = id;
+
+            strncpy(statement.rowToInsert.username, username.c_str(), COLUMN_USERNAME_SIZE);
+            statement.rowToInsert.username[COLUMN_USERNAME_SIZE] = '\0';
+
+            strncpy(statement.rowToInsert.email, email.c_str(), COLUMN_EMAIL_SIZE);
+            statement.rowToInsert.email[COLUMN_EMAIL_SIZE] = '\0';
+
             return PrepareResult::PREPARE_SUCCESS;
         }
         else
@@ -202,10 +220,21 @@ int main()
 
     Table* table = newTable();
 
+    bool isInteractive = isatty(STDIN_FILENO);
+
     while(true)
     {
-        std::cout << "db > ";
-        std::getline(std::cin, userInput);
+        if(isInteractive)
+            std::cout << "db > " << std::flush;
+            
+        if(!std::getline(std::cin, userInput))
+            break;
+
+        if(!userInput.empty() && userInput.back() == '\r')
+            userInput.pop_back();
+
+        if(userInput.empty())
+            continue;
         
         if(userInput[0] == '.')
         {
@@ -229,6 +258,11 @@ int main()
                 std::cout << "Error: Table is full\n";
             }
             std::cout << "Executed\n";
+            continue;
+        }
+        else if(result == PrepareResult::PREPARE_STRING_TOO_LONG)
+        {
+            std::cout << "String is too long.\n";
             continue;
         }
         else if(result == PrepareResult::PREPARE_UNRECOGNIZED_STATEMENT)
