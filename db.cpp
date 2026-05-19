@@ -4,6 +4,9 @@
 #include <cstdint>
 #include <cstring>
 #include <unistd.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <io.h>
 
 const uint32_t COLUMN_USERNAME_SIZE = 32;
 const uint32_t COLUMN_EMAIL_SIZE = 255;
@@ -49,10 +52,24 @@ enum class ExecuteResult
     EXECUTE_TABLE_FULL
 };
 
+struct Pager
+{
+    int fileDescriptor;
+    uint32_t fileLength;
+    void* pages[TABLE_MAX_PAGES];
+};
+
 struct Table
 {
     uint32_t numRows;
-    void* pages[TABLE_MAX_PAGES];
+    Pager* pager;
+};
+
+struct Cursor
+{
+    Table* table;
+    uint32_t rowNum;
+    bool endOfTable; // boolean flag to tell us if we have reached the end of the table
 };
 
 struct Row
@@ -68,17 +85,119 @@ struct Statement
     Row rowToInsert;
 };
 
-Table* newTable()
+// opens a file and initializes a pager
+Pager* pagerOpen(const char* filename)
 {
-    Table* table = new Table();
-    table->numRows = 0;
-    
-    for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    // _O_RDWR means Read/Write. _O_CREAT means create it if it doesn't exist.
+    // _S_IREAD | _S_IWRITE sets the Windows file permissions.
+    int fd = _open(filename, _O_RDWR | _O_CREAT | _O_BINARY , _S_IREAD | _S_IWRITE);
+
+    if(fd == -1)
     {
-        table->pages[i] = nullptr;
+        std::cout << "Unable to open file.\n";
+        exit(EXIT_FAILURE);
     }
 
+    // how many bytes are in the file
+    uint32_t fileLength = _filelength(fd);
+
+    Pager* pager = new Pager();
+    pager->fileDescriptor = fd;
+    pager->fileLength = fileLength;
+
+    for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    {
+        pager->pages[i] = nullptr;
+    }
+
+    return pager;
+}
+
+// creating a new table object
+Table* dbOpen(const char* filename)
+{
+    Pager* pager = pagerOpen(filename);
+
+    Table* table = new Table();
+    table->pager = pager;
+    table->numRows = pager->fileLength / ROW_SIZE;
+
     return table;
+}
+
+// this function saves data to hard drive and empties cache before exiting
+void dbClose(Table* table)
+{
+    uint32_t numFullPages = table->numRows / ROWS_PER_PAGE;
+    uint32_t numAdditionalRows = table->numRows % ROWS_PER_PAGE;    
+
+    Pager* pager = table->pager;
+
+    for(uint32_t i = 0; i < numFullPages; i++)
+    {
+        // We only want to save pages that actually exist in the cache
+        if(pager->pages[i] == nullptr)
+            continue;
+
+        // Moving the hard drive's write head to the correct location
+        _lseek(pager->fileDescriptor, i * PAGE_SIZE, SEEK_SET);
+        // Writing PAGE_SIZE bytes from RAM into file
+        _write(pager->fileDescriptor, pager->pages[i], PAGE_SIZE);
+    }
+
+    if(numAdditionalRows > 0)
+    {
+        if(pager->pages[numFullPages] != nullptr)
+        {
+            _lseek(pager->fileDescriptor, numFullPages * PAGE_SIZE, SEEK_SET);
+            _write(pager->fileDescriptor, pager->pages[numFullPages], numAdditionalRows * ROW_SIZE);
+        }
+    }
+
+    // Freeing up memory
+    for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++)
+    {
+        void* page = pager->pages[i];
+
+        if(page)
+        {
+            delete[] static_cast<char*>(page);
+            pager->pages[i] = nullptr;
+        }
+    }
+
+    delete pager;
+    delete table;
+
+    // Safely releasing file back to Windows
+    _close(pager->fileDescriptor);
+}
+
+// creating a brand new cursor object
+Cursor* tableStart(Table* table)
+{
+    Cursor* cursor = new Cursor();
+    cursor->table = table;
+    cursor->rowNum = 0;
+
+    if(table->numRows == 0)
+        cursor->endOfTable = true;
+    else
+        cursor->endOfTable = false;
+
+    return cursor;
+}
+
+// This function creates a cursor that represents the very end of our database
+// where a new row should be appended
+Cursor* tableEnd(Table* table)
+{
+    Cursor* cursor = new Cursor();
+    cursor->table = table;
+    cursor->rowNum = table->numRows;
+    cursor->endOfTable = true;
+
+    return cursor;
 }
 
 // Takes a source row and a destination
@@ -102,32 +221,85 @@ void deserializeRow(void* source, Row* destination)
     memcpy(destination->email, sour + EMAIL_OFFSET, EMAIL_SIZE);
 }
 
-void* rowSlot(Table* table, uint32_t rowNum)
+// returns if page exists in pager ram
+// otherwise reads and loads from hard drive
+void* getPage(Pager* pager, uint32_t pageNum)
 {
-    //calculating which page will contain the row based on its number
-    uint32_t pageNum = rowNum / ROWS_PER_PAGE;
-
-    //fetching the page
-    void* page = table->pages[pageNum];
-    
-    //if page is empty we allocate memory to it
-    if(page == nullptr)
+    if(pageNum > TABLE_MAX_PAGES)
     {
-        page = table->pages[pageNum] = new char[PAGE_SIZE];
+        std::cout << "Tried to fetch page number out of bounds. " << pageNum << "\n";
+        exit(EXIT_FAILURE);
     }
 
+    // Cache miss - page doesn't exist in memory
+    if(pager->pages[pageNum] == nullptr)
+    {
+        void* page = new char[PAGE_SIZE];
+
+        // If page already exists in hard drive
+        uint32_t numPages = pager->fileLength / PAGE_SIZE;
+
+        // If file length isn't a perfect multiple
+        // last saved page is partially full
+        if(pager->fileLength % PAGE_SIZE)
+        {
+            numPages += 1;
+        }
+
+        if(pageNum <= numPages)
+        {
+            // move the file reader head to the exact byte where the page started
+            _lseek(pager->fileDescriptor, pageNum * PAGE_SIZE, SEEK_SET);
+
+            // read PAGE_SIZE bytes from file descriptor to our page
+            int bytesRead = _read(pager->fileDescriptor, page, PAGE_SIZE);
+            if(bytesRead == -1)
+            {
+                std::cout << "Error reading file.\n";
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        // Save the loaded page into our pager
+        pager->pages[pageNum] = page;
+    }
+
+    return pager->pages[pageNum];
+}
+
+// asks pager for page, calculates the offset and returns the pointer(memory address)
+void* cursorValue(Cursor* cursor)
+{
+    //calculating which page will contain the row based on its number
+    uint32_t pageNum = cursor->rowNum / ROWS_PER_PAGE;
+
+    //fetching the page
+    void* page = getPage(cursor->table->pager, pageNum);
+
     //calculating rowoffset and byteoffset
-    uint32_t rowOffset = rowNum % ROWS_PER_PAGE;
+    uint32_t rowOffset = cursor->rowNum % ROWS_PER_PAGE;
     uint32_t byteOffset = rowOffset * ROW_SIZE;
 
     //returning exact memory address by adding the byte offset
     return static_cast<char*>(page) + byteOffset;
 }
 
-MetaCommandResult doMetaCommand(const std::string& command)
+// function to move the cursor forward
+void cursorAdvance(Cursor* cursor)
+{
+    cursor->rowNum += 1;
+    
+    if(cursor->rowNum >= cursor->table->numRows)
+    {
+        cursor->endOfTable = true;
+    }
+}
+
+MetaCommandResult doMetaCommand(const std::string& command, Table* table)
 {
     if(command == ".exit")
     {
+        dbClose(table); // saving everything to hard drive
         std::cout << "Exiting database...\n";
         exit(EXIT_SUCCESS);
         return MetaCommandResult::META_COMMAND_SUCCESS;
@@ -189,9 +361,16 @@ ExecuteResult executeStatement(Statement& statement, Table* table)
             {
                 return ExecuteResult::EXECUTE_TABLE_FULL;
             }
-            void* destination = static_cast<void*>(rowSlot(table, table->numRows));
+            //getting a bookmark to the end of memory
+            Cursor* cursor = tableEnd(table);
+            // getting the memory address that the bookmark points to
+            void* destination = static_cast<void*>(cursorValue(cursor));
+            // writing the data
             serializeRow(&(statement.rowToInsert), destination);
             table->numRows += 1;
+            // deleting the object so that we don't leak RAM
+            delete cursor;
+
             std::cout << "Inserting: " << statement.rowToInsert.id << " " << statement.rowToInsert.username << " " << statement.rowToInsert.email << "\n";
             return ExecuteResult::EXECUTE_SUCCESS;
             break;
@@ -199,13 +378,21 @@ ExecuteResult executeStatement(Statement& statement, Table* table)
 
         case StatementType::STATEMENT_SELECT:
         {
-            for(uint32_t i = 0; i < table->numRows; i++)
+            Cursor* cursor = tableStart(table);
+
+            while(!(cursor->endOfTable))
             {
                 Row row;
-                void* source = static_cast<void*>(rowSlot(table, i));
+                
+                void* source = static_cast<void*>(cursorValue(cursor));
                 deserializeRow(source, &row);
                 std::cout << "( " << row.id << ", " << row.username << ", " << row.email << " )\n";
+
+                cursorAdvance(cursor);
             }
+
+            delete cursor;
+
             return ExecuteResult::EXECUTE_SUCCESS;
             break;
         }
@@ -218,7 +405,7 @@ int main()
 {
     std::string userInput;
 
-    Table* table = newTable();
+    Table* table = dbOpen("mydb.db");
 
     bool isInteractive = isatty(STDIN_FILENO);
 
@@ -238,7 +425,7 @@ int main()
         
         if(userInput[0] == '.')
         {
-            switch(doMetaCommand(userInput))
+            switch(doMetaCommand(userInput, table))
             {
                 case MetaCommandResult::META_COMMAND_SUCCESS:
                     continue;
